@@ -1,0 +1,171 @@
+  - type: sections
+    max_columns: 3
+    title: Solar Cameras
+    path: solar-cameras
+    icon: ''
+    sections:
+      # AC SECTION - Real-time power flow and voltage monitoring
+      - type: grid
+        cards:
+          - type: heading
+            heading: AC System
+            heading_style: title
+          # Status indicators at top
+          - type: tile
+            entity: binary_sensor.solar_monitor_ac_output_active
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: binary_sensor.solar_monitor_dc_output_active
+            grid_options:
+              columns: 6
+          # Voltage gauges side-by-side
+          - type: gauge
+            entity: sensor.solar_monitor_ac_input_voltage
+            grid_options:
+              columns: 6
+              rows: auto
+          - type: gauge
+            entity: sensor.solar_monitor_ac_output_voltage
+            min: 100
+            max: 140
+            needle: false
+            grid_options:
+              columns: 6
+              rows: auto
+          # Power and temp
+          - type: tile
+            entity: sensor.solar_monitor_ac_output_power
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.solar_monitor_inverter_temperature
+            grid_options:
+              columns: 6
+
+      # BATTERY SECTION - Organized into logical subsections
+      - type: grid
+        cards:
+          - type: heading
+            heading_style: title
+            heading: Battery Health
+          
+          # Battery State
+          - type: tile
+            entity: binary_sensor.solar_monitor_charging
+            grid_options:
+              columns: 12
+          - type: tile
+            entity: sensor.solar_monitor_battery_soc
+            grid_options:
+              columns: 12
+          
+          # Power metrics (2 columns)
+          - type: tile
+            entity: sensor.solar_monitor_battery_power
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.solar_monitor_charge_power
+            grid_options:
+              columns: 6
+          
+          # Voltage metrics (2 columns)
+          - type: tile
+            entity: sensor.solar_monitor_pack_voltage
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.solar_monitor_cell_voltage
+            grid_options:
+              columns: 6
+          
+          # Current and temps (2 columns)
+          - type: tile
+            entity: sensor.solar_monitor_battery_current
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.solar_monitor_battery_temperature
+            grid_options:
+              columns: 6
+          
+          # Secondary temp
+          - type: tile
+            entity: sensor.solar_monitor_battery_temperature_2
+            grid_options:
+              columns: 6
+
+          # Solar Input Section
+          - type: heading
+            icon: mdi:solar-panel-large
+            heading: Solar Input
+            heading_style: title
+          - type: tile
+            entity: sensor.solar_monitor_solar_power
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.solar_monitor_solar_voltage
+            grid_options:
+              columns: 6
+
+      # NETWORK SECTION - All network devices and health
+      - type: grid
+        cards:
+          - type: heading
+            heading: Network Health
+            heading_style: title
+          
+          # Cameras
+          - type: tile
+            entity: device_tracker.uvc_g5_bullet
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: device_tracker.uvc_g5_bullet_2
+            grid_options:
+              columns: 6
+          
+          # Switch
+          - type: tile
+            entity: sensor.usw_flex_state
+            name: Switch State
+            grid_options:
+              columns: 6
+          - type: tile
+            entity: sensor.usw_flex_uptime
+            name: Switch Uptime
+            grid_options:
+              columns: 6
+          
+          # Primary Radio - more compact
+          - type: entities
+            entities:
+              - entity: sensor.state
+                name: State
+              - entity: sensor.udb_pro_uptime
+                name: Uptime
+              - entity: light.remote_bridge_pole_led
+                name: LED
+              - entity: sensor.remote_bridge_primary_temperature
+                name: Temp
+            title: Primary Radio
+            grid_options:
+              columns: 12
+          
+          # Pole Radio - more compact
+          - type: entities
+            entities:
+              - entity: sensor.udb_pro_state
+                name: State
+              - entity: sensor.udb_pro_uptime
+                name: Uptime
+              - entity: light.remote_bridge_pole_led
+                name: LED
+              - entity: sensor.remote_bridge_pole_temperature
+                name: Temp
+            title: Pole Radio
+            grid_options:
+              columns: 12
+    cards: []

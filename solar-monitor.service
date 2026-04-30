@@ -1,0 +1,20 @@
+[Unit]
+Description=Solar Monitor v2 — GoKWh + Renogy + Pi → Home Assistant
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/solar-monitor/.env
+ExecStart=/usr/bin/python3 /opt/solar-monitor/solar_monitor_v2.py --mac ${BLE_MAC}
+WorkingDirectory=/opt/solar-monitor
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
