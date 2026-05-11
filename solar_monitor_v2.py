@@ -66,6 +66,7 @@ BLE_CONNECT_TIMEOUT = 20    # seconds
 BLE_CMD_TIMEOUT = 5         # seconds to wait for each command response
 BLE_POLL_INTERVAL = 60      # seconds between poll cycles
 BLE_POLL_TIMEOUT = 45       # max seconds for entire poll (scan+connect+cmds)
+BLE_CONNECT_RETRIES = 3     # connect attempts per poll cycle
 BLE_DEVICE_NAME = "XDZN"   # BLE name prefix for GoKWh (TDT BMS)
 BLE_RESET_THRESHOLD = 5     # consecutive fails before resetting BlueZ
 
@@ -83,6 +84,21 @@ KEEPALIVE_INTERVAL_S = 4 * 3600   # fan keep-alive pulse every 4h
 KEEPALIVE_DURATION_S = 90         # 90s fan-on per keep-alive pulse
 
 
+async def _run(cmd, timeout=10):
+    """Run a shell command; return True on success, False on failure/timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd.split(),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode == 0
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False
+
+
 async def reset_bluez():
     """Escalating reset of the BlueZ adapter to clear wedged state.
 
@@ -90,19 +106,6 @@ async def reset_bluez():
     Level 2: rfkill + bluetooth service restart (clears deeper hangs)
     Level 3: full system reboot (clears wedged UART/firmware)
     """
-
-    async def _run(cmd, timeout=10):
-        proc = await asyncio.create_subprocess_exec(
-            *cmd.split(),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return proc.returncode == 0
-        except asyncio.TimeoutError:
-            proc.kill()
-            return False
 
     async def _bt_is_up():
         proc = await asyncio.create_subprocess_exec(
@@ -113,12 +116,12 @@ async def reset_bluez():
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         return b"UP RUNNING" in out
 
-    # Level 1: btmgmt power cycle
-    log.warning("BlueZ reset — level 1: btmgmt power cycle")
-    await _run("btmgmt power off")
-    await asyncio.sleep(1)
-    await _run("btmgmt power on")
+    # Level 1: HCI adapter reset (clears firmware-level wedges)
+    log.warning("BlueZ reset — level 1: HCI adapter reset")
+    await _run("hciconfig hci0 reset")
     await asyncio.sleep(2)
+    await _run("hciconfig hci0 up")
+    await asyncio.sleep(1)
     if await _bt_is_up():
         log.info("BlueZ recovered (level 1)")
         return
@@ -321,9 +324,25 @@ async def poll_battery(
 
     # ── Scan ──────────────────────────────────────────────────────
     log.debug("BLE scan (%d s)…", BLE_SCAN_TIMEOUT)
-    devices = await BleakScanner.discover(
-        timeout=BLE_SCAN_TIMEOUT, return_adv=True,
-    )
+    devices = None
+    for scan_attempt in range(2):
+        try:
+            devices = await BleakScanner.discover(
+                timeout=BLE_SCAN_TIMEOUT, return_adv=True,
+            )
+            break
+        except Exception as e:
+            if scan_attempt == 0 and "InProgress" in str(e):
+                log.warning("Stale BLE scan detected — resetting HCI adapter")
+                await _run("hciconfig hci0 reset")
+                await asyncio.sleep(2)
+                await _run("hciconfig hci0 up")
+                await asyncio.sleep(1)
+            else:
+                log.error("BLE scan failed: %s", e)
+                return None, None
+    if devices is None:
+        return None, None
     device = None
     for addr, (dev, adv) in devices.items():
         name = adv.local_name or dev.name or ""
@@ -340,15 +359,33 @@ async def poll_battery(
 
     log.debug("Found %s (%s)", device.name or "?", device.address)
 
-    # ── Connect ───────────────────────────────────────────────────
-    client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT)
+    # ── Connect (with retry) ─────────────────────────────────────
+    # Fresh BleakClient per attempt — a failed connect can leave the
+    # client/BlueZ in a dirty state, so reusing the same object risks
+    # compounding the problem.
+    client = None
     try:
-        await client.connect()
-    except Exception as e:
-        log.error("BLE connect failed: %s", e)
-        return None, None
+        for attempt in range(1, BLE_CONNECT_RETRIES + 1):
+            client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT)
+            try:
+                await client.connect()
+                break
+            except Exception as e:
+                # Best-effort cleanup of partial connection state
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
+                except Exception:
+                    pass
+                client = None
+                if attempt < BLE_CONNECT_RETRIES:
+                    log.warning("BLE connect attempt %d/%d failed: %s",
+                                attempt, BLE_CONNECT_RETRIES, e)
+                    await asyncio.sleep(2)
+                else:
+                    log.error("BLE connect failed after %d attempts: %s",
+                              BLE_CONNECT_RETRIES, e)
+                    return None, None
 
-    try:
         # Grab characteristic objects right away (bleak macOS cache quirk)
         svcs = client.services
         await asyncio.sleep(0.5)
@@ -438,9 +475,9 @@ async def poll_battery(
         return None, None
 
     finally:
-        if client.is_connected:
+        if client:
             try:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), timeout=5)
             except Exception:
                 pass
 
