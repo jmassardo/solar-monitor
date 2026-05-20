@@ -544,10 +544,12 @@ def _disco_binary(client, prefix, device, obj_id, name,
 
 # ── GoKWh Battery ──────────────────────────────────────────────────
 
-def publish_gokwh_discovery(client, prefix, device, device_info=None):
+def publish_gokwh_discovery(client, prefix, device, device_info=None, mac=None):
     """Register GoKWh battery entities with HA."""
     p = prefix
     d = dict(device)
+    if mac:
+        d["connections"] = [["mac", mac.upper()]]
     if device_info:
         if device_info.get("sw_version"):
             d["sw_version"] = device_info["sw_version"]
@@ -861,7 +863,7 @@ async def main():
 
         for prefix, device, _mac in batteries:
             publish_gokwh_discovery(client, prefix, device,
-                                    gokwh_device_infos[prefix])
+                                    gokwh_device_infos[prefix], mac=_mac)
             client.publish(f"{prefix}/availability", "online",
                            qos=1, retain=True)
 
@@ -942,7 +944,7 @@ async def main():
                         if info and info != gokwh_device_infos[prefix]:
                             gokwh_device_infos[prefix] = info
                             publish_gokwh_discovery(mqtt_client, prefix,
-                                                    device, info)
+                                                    device, info, mac=mac)
                             log.info("%s device info: %s", device["name"], info)
 
                         log.info(
