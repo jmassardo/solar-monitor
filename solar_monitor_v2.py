@@ -3,7 +3,7 @@
 Solar Monitor v2 — Home Assistant MQTT Service
 
 Monitors solar equipment and publishes to Home Assistant via MQTT:
-  • GoKWh 100Ah LiFePO4 Battery  (BLE, TDT protocol)
+  • GoKWh 100Ah LiFePO4 Batteries (×2, BLE, TDT protocol)
   • Renogy Wanderer 10A PWM       (RS232, Modbus — not yet implemented)
   • Solar Pi management            (BME280, door, fans — Pi-only)
 
@@ -11,6 +11,7 @@ Each component appears as a separate device in Home Assistant.
 
 Usage:
     python3 solar_monitor_v2.py [--mqtt-host $MQTT_HOST] [--debug]
+    python3 solar_monitor_v2.py --mac1 AA:BB:CC:DD:EE:FF --mac2 11:22:33:44:55:66
     python3 solar_monitor_v2.py --no-pi   # Mac testing (no GPIO/BME280)
 """
 
@@ -153,6 +154,14 @@ GOKWH_PREFIX = "solar_gokwh"
 GOKWH_DEVICE = {
     "identifiers": ["solar_gokwh_battery"],
     "name": "GoKWh Battery",
+    "manufacturer": "GoKWh",
+    "model": "100Ah LiFePO4",
+}
+
+GOKWH_2_PREFIX = "solar_gokwh_2"
+GOKWH_2_DEVICE = {
+    "identifiers": ["solar_gokwh_battery_2"],
+    "name": "GoKWh Battery 2",
     "manufacturer": "GoKWh",
     "model": "100Ah LiFePO4",
 }
@@ -349,7 +358,7 @@ async def poll_battery(
         if mac and addr.upper() == mac.upper():
             device = dev
             break
-        if name.upper().startswith(name_prefix.upper()):
+        if not mac and name.upper().startswith(name_prefix.upper()):
             device = dev
             break
 
@@ -535,10 +544,10 @@ def _disco_binary(client, prefix, device, obj_id, name,
 
 # ── GoKWh Battery ──────────────────────────────────────────────────
 
-def publish_gokwh_discovery(client, device_info=None):
-    """Register all GoKWh battery entities with HA."""
-    p = GOKWH_PREFIX
-    d = dict(GOKWH_DEVICE)
+def publish_gokwh_discovery(client, prefix, device, device_info=None):
+    """Register GoKWh battery entities with HA."""
+    p = prefix
+    d = dict(device)
     if device_info:
         if device_info.get("sw_version"):
             d["sw_version"] = device_info["sw_version"]
@@ -570,12 +579,12 @@ def publish_gokwh_discovery(client, device_info=None):
     _disco_binary(client, p, d, "protection_active", "Protection Active",
                   "problem")
 
-    log.info("GoKWh discovery published (19 entities)")
+    log.info("%s discovery published (19 entities)", d["name"])
 
 
-def publish_gokwh_state(client, data: dict):
-    """Push all GoKWh battery sensor values to MQTT."""
-    p = GOKWH_PREFIX
+def publish_gokwh_state(client, prefix, data: dict):
+    """Push GoKWh battery sensor values to MQTT."""
+    p = prefix
 
     _pub(client, p, "pack_voltage", f"{data['voltage']:.2f}")
     _pub(client, p, "current", f"{data['current']:.1f}")
@@ -802,7 +811,10 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Solar Monitor v2 — GoKWh + Renogy + Pi → Home Assistant",
     )
-    parser.add_argument("--mac", help="GoKWh battery MAC (optional, for Linux)")
+    parser.add_argument("--mac", "--mac1", dest="mac1",
+                        help="GoKWh battery 1 MAC address")
+    parser.add_argument("--mac2",
+                        help="GoKWh battery 2 MAC address")
     parser.add_argument("--mqtt-host", default=MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=MQTT_PORT)
     parser.add_argument("--poll-interval", type=int, default=BLE_POLL_INTERVAL,
@@ -817,8 +829,18 @@ async def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # ── Resolve battery MACs ──────────────────────────────────────
+    mac1 = args.mac1 or os.environ.get("BLE_MAC_1") or os.environ.get("BLE_MAC")
+    mac2 = args.mac2 or os.environ.get("BLE_MAC_2")
+
+    # Build list of battery configs: (prefix, device_dict, mac)
+    batteries = [(GOKWH_PREFIX, GOKWH_DEVICE, mac1)]
+    if mac2:
+        batteries.append((GOKWH_2_PREFIX, GOKWH_2_DEVICE, mac2))
+
     # ── Shared state ──────────────────────────────────────────────
-    gokwh_device_info = None   # populated on first successful poll
+    # Per-battery device info, populated on first successful poll
+    gokwh_device_infos = {prefix: None for prefix, _, _ in batteries}
 
     # ── MQTT client ───────────────────────────────────────────────
     mqtt_client = mqtt.Client(
@@ -837,9 +859,11 @@ async def main():
             return
         log.info("MQTT connected to %s:%d", args.mqtt_host, args.mqtt_port)
 
-        publish_gokwh_discovery(client, gokwh_device_info)
-        client.publish(f"{GOKWH_PREFIX}/availability", "online",
-                       qos=1, retain=True)
+        for prefix, device, _mac in batteries:
+            publish_gokwh_discovery(client, prefix, device,
+                                    gokwh_device_infos[prefix])
+            client.publish(f"{prefix}/availability", "online",
+                           qos=1, retain=True)
 
         if not args.no_wanderer:
             publish_wanderer_discovery(client)
@@ -874,61 +898,78 @@ async def main():
         pi_mgr = PiManager(mqtt_client)
         _pub(mqtt_client, PI_PREFIX, "fan_mode", "Auto")
 
-    log.info("Starting poll loops: battery=%ds, pi=%ds",
-             args.poll_interval, PI_POLL_INTERVAL if pi_mgr else 0)
+    log.info("Starting poll loops: battery=%ds (%d batteries), pi=%ds",
+             args.poll_interval, len(batteries),
+             PI_POLL_INTERVAL if pi_mgr else 0)
 
     # ── Shared state across tasks ────────────────────────────────
-    # Written atomically by battery_loop, read by pi_loop
-    shared = {"battery_temps": None, "battery_temps_at": 0.0}
+    # Per-battery temps, written by battery_loop, read by pi_loop
+    shared = {
+        "battery_temps": {},      # prefix → temp list
+        "battery_temps_at": {},   # prefix → timestamp
+    }
 
     # ── Battery polling task ──────────────────────────────────────
     async def battery_loop():
-        nonlocal gokwh_device_info
-        consecutive_fails = 0
+        # Per-battery tracking
+        consecutive_fails = {prefix: 0 for prefix, _, _ in batteries}
         ev_loop = asyncio.get_event_loop()
 
         while True:
             t0 = ev_loop.time()
             try:
-                try:
-                    data, info = await asyncio.wait_for(
-                        poll_battery(mac=args.mac),
-                        timeout=BLE_POLL_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("BLE poll timed out after %ds", BLE_POLL_TIMEOUT)
-                    data, info = None, None
-                except Exception as e:
-                    log.warning("BLE poll error: %s", e)
-                    data, info = None, None
+                for prefix, device, mac in batteries:
+                    try:
+                        data, info = await asyncio.wait_for(
+                            poll_battery(mac=mac),
+                            timeout=BLE_POLL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("%s: BLE poll timed out after %ds",
+                                    device["name"], BLE_POLL_TIMEOUT)
+                        data, info = None, None
+                    except Exception as e:
+                        log.warning("%s: BLE poll error: %s", device["name"], e)
+                        data, info = None, None
 
-                if data:
-                    consecutive_fails = 0
-                    _pub(mqtt_client, GOKWH_PREFIX, "ble_connected", "ON")
-                    publish_gokwh_state(mqtt_client, data)
-                    shared["battery_temps"] = data.get("temperatures")
-                    shared["battery_temps_at"] = time.time()
+                    if data:
+                        consecutive_fails[prefix] = 0
+                        _pub(mqtt_client, prefix, "ble_connected", "ON")
+                        publish_gokwh_state(mqtt_client, prefix, data)
+                        shared["battery_temps"][prefix] = data.get("temperatures")
+                        shared["battery_temps_at"][prefix] = time.time()
 
-                    if info and info != gokwh_device_info:
-                        gokwh_device_info = info
-                        publish_gokwh_discovery(mqtt_client, info)
-                        log.info("Device info: %s", info)
+                        if info and info != gokwh_device_infos[prefix]:
+                            gokwh_device_infos[prefix] = info
+                            publish_gokwh_discovery(mqtt_client, prefix,
+                                                    device, info)
+                            log.info("%s device info: %s", device["name"], info)
 
-                    log.info(
-                        "Battery: %.2fV  %.1fA  %d%%  %.1f°C  Δ%dmV",
-                        data["voltage"], data["current"], data["soc"],
-                        data["temperatures"][0] if data["temperatures"] else 0,
-                        data["cell_delta"],
-                    )
-                else:
-                    consecutive_fails += 1
-                    _pub(mqtt_client, GOKWH_PREFIX, "ble_connected", "OFF")
-                    if consecutive_fails >= BLE_RESET_THRESHOLD:
-                        log.error("%d consecutive BLE failures — resetting BlueZ",
-                                  consecutive_fails)
-                        await reset_bluez()
-                        consecutive_fails = 0
-                        shared["battery_temps"] = None
+                        log.info(
+                            "%s: %.2fV  %.1fA  %d%%  %.1f°C  Δ%dmV",
+                            device["name"],
+                            data["voltage"], data["current"], data["soc"],
+                            data["temperatures"][0] if data.get("temperatures") else 0,
+                            data["cell_delta"],
+                        )
+                    else:
+                        consecutive_fails[prefix] += 1
+                        _pub(mqtt_client, prefix, "ble_connected", "OFF")
+
+                    # Small gap between polling each battery
+                    if len(batteries) > 1:
+                        await asyncio.sleep(2)
+
+                # Reset BlueZ only when ALL batteries are failing
+                if all(f >= BLE_RESET_THRESHOLD
+                       for f in consecutive_fails.values()):
+                    total = sum(consecutive_fails.values())
+                    log.error("%d total consecutive BLE failures — resetting BlueZ",
+                              total)
+                    await reset_bluez()
+                    for p in consecutive_fails:
+                        consecutive_fails[p] = 0
+                    shared["battery_temps"].clear()
 
             except asyncio.CancelledError:
                 raise
@@ -945,10 +986,18 @@ async def main():
         while True:
             try:
                 now = time.time()
-                temps_age = now - shared["battery_temps_at"]
+                # Combine fresh temps from all batteries
+                all_temps = []
+                oldest_age = 0.0
+                for prefix in shared["battery_temps"]:
+                    age = now - shared["battery_temps_at"].get(prefix, 0)
+                    temps = shared["battery_temps"].get(prefix)
+                    if temps and age <= BATTERY_TEMP_TTL:
+                        all_temps.extend(temps)
+                    oldest_age = max(oldest_age, age)
                 pi_mgr.update(
-                    battery_temps=shared["battery_temps"],
-                    battery_temps_age=temps_age,
+                    battery_temps=all_temps or None,
+                    battery_temps_age=oldest_age,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1000,8 +1049,9 @@ async def main():
 
     # ── Cleanup ───────────────────────────────────────────────────
     log.info("Shutting down…")
-    mqtt_client.publish(f"{GOKWH_PREFIX}/availability", "offline",
-                        qos=1, retain=True)
+    for prefix, _, _ in batteries:
+        mqtt_client.publish(f"{prefix}/availability", "offline",
+                            qos=1, retain=True)
     if not args.no_pi:
         mqtt_client.publish(f"{PI_PREFIX}/availability", "offline",
                             qos=1, retain=True)
