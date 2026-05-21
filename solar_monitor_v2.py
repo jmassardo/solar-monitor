@@ -153,7 +153,7 @@ async def reset_bluez():
 GOKWH_PREFIX = "solar_gokwh"
 GOKWH_DEVICE = {
     "identifiers": ["solar_gokwh_battery"],
-    "name": "GoKWh Battery",
+    "name": "GoKWh Battery - 482F",
     "manufacturer": "GoKWh",
     "model": "100Ah LiFePO4",
 }
@@ -161,7 +161,7 @@ GOKWH_DEVICE = {
 GOKWH_2_PREFIX = "solar_gokwh_2"
 GOKWH_2_DEVICE = {
     "identifiers": ["solar_gokwh_battery_2"],
-    "name": "GoKWh Battery 2",
+    "name": "GoKWh Battery - C7DD",
     "manufacturer": "GoKWh",
     "model": "100Ah LiFePO4",
 }
