@@ -3,14 +3,15 @@
 Solar Monitor v2 — Home Assistant MQTT Service
 
 Monitors solar equipment and publishes to Home Assistant via MQTT:
-  • GoKWh 100Ah LiFePO4 Battery  (BLE, TDT protocol)
-  • Renogy Wanderer 10A PWM       (RS232, Modbus — not yet implemented)
+  • GoKWh 100Ah LiFePO4 Batteries (×2, BLE, TDT protocol)
+  • Renogy Wanderer Li 30A PWM   (read-only Modbus via BT-1 BLE)
   • Solar Pi management            (BME280, door, fans — Pi-only)
 
 Each component appears as a separate device in Home Assistant.
 
 Usage:
     python3 solar_monitor_v2.py [--mqtt-host $MQTT_HOST] [--debug]
+    python3 solar_monitor_v2.py --mac1 AA:BB:CC:DD:EE:FF --mac2 11:22:33:44:55:66
     python3 solar_monitor_v2.py --no-pi   # Mac testing (no GPIO/BME280)
 """
 
@@ -19,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -66,8 +68,10 @@ BLE_CONNECT_TIMEOUT = 20    # seconds
 BLE_CMD_TIMEOUT = 5         # seconds to wait for each command response
 BLE_POLL_INTERVAL = 60      # seconds between poll cycles
 BLE_POLL_TIMEOUT = 45       # max seconds for entire poll (scan+connect+cmds)
+BLE_CONNECT_RETRIES = 3     # connect attempts per poll cycle
 BLE_DEVICE_NAME = "XDZN"   # BLE name prefix for GoKWh (TDT BMS)
 BLE_RESET_THRESHOLD = 5     # consecutive fails before resetting BlueZ
+WANDERER_ADDRESS = 0xFF     # Renogy standalone address, not a broadcast
 
 # Pi management (active only when running on Pi with --no-pi omitted)
 RELAY_PIN = 22              # BCM GPIO22 → relay module IN
@@ -83,6 +87,21 @@ KEEPALIVE_INTERVAL_S = 4 * 3600   # fan keep-alive pulse every 4h
 KEEPALIVE_DURATION_S = 90         # 90s fan-on per keep-alive pulse
 
 
+async def _run(cmd, timeout=10):
+    """Run a shell command; return True on success, False on failure/timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd.split(),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode == 0
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False
+
+
 async def reset_bluez():
     """Escalating reset of the BlueZ adapter to clear wedged state.
 
@@ -90,19 +109,6 @@ async def reset_bluez():
     Level 2: rfkill + bluetooth service restart (clears deeper hangs)
     Level 3: full system reboot (clears wedged UART/firmware)
     """
-
-    async def _run(cmd, timeout=10):
-        proc = await asyncio.create_subprocess_exec(
-            *cmd.split(),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return proc.returncode == 0
-        except asyncio.TimeoutError:
-            proc.kill()
-            return False
 
     async def _bt_is_up():
         proc = await asyncio.create_subprocess_exec(
@@ -113,12 +119,12 @@ async def reset_bluez():
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         return b"UP RUNNING" in out
 
-    # Level 1: btmgmt power cycle
-    log.warning("BlueZ reset — level 1: btmgmt power cycle")
-    await _run("btmgmt power off")
-    await asyncio.sleep(1)
-    await _run("btmgmt power on")
+    # Level 1: HCI adapter reset (clears firmware-level wedges)
+    log.warning("BlueZ reset — level 1: HCI adapter reset")
+    await _run("hciconfig hci0 reset")
     await asyncio.sleep(2)
+    await _run("hciconfig hci0 up")
+    await asyncio.sleep(1)
     if await _bt_is_up():
         log.info("BlueZ recovered (level 1)")
         return
@@ -149,7 +155,15 @@ async def reset_bluez():
 GOKWH_PREFIX = "solar_gokwh"
 GOKWH_DEVICE = {
     "identifiers": ["solar_gokwh_battery"],
-    "name": "GoKWh Battery",
+    "name": "GoKWh Battery - 482F",
+    "manufacturer": "GoKWh",
+    "model": "100Ah LiFePO4",
+}
+
+GOKWH_2_PREFIX = "solar_gokwh_2"
+GOKWH_2_DEVICE = {
+    "identifiers": ["solar_gokwh_battery_2"],
+    "name": "GoKWh Battery - C7DD",
     "manufacturer": "GoKWh",
     "model": "100Ah LiFePO4",
 }
@@ -159,7 +173,7 @@ WANDERER_DEVICE = {
     "identifiers": ["solar_renogy_wanderer"],
     "name": "Renogy Wanderer",
     "manufacturer": "Renogy",
-    "model": "Wanderer 10A PWM",
+    "model": "Wanderer Li 30A PWM",
 }
 
 PI_PREFIX = "solar_pi"
@@ -321,16 +335,32 @@ async def poll_battery(
 
     # ── Scan ──────────────────────────────────────────────────────
     log.debug("BLE scan (%d s)…", BLE_SCAN_TIMEOUT)
-    devices = await BleakScanner.discover(
-        timeout=BLE_SCAN_TIMEOUT, return_adv=True,
-    )
+    devices = None
+    for scan_attempt in range(2):
+        try:
+            devices = await BleakScanner.discover(
+                timeout=BLE_SCAN_TIMEOUT, return_adv=True,
+            )
+            break
+        except Exception as e:
+            if scan_attempt == 0 and "InProgress" in str(e):
+                log.warning("Stale BLE scan detected — resetting HCI adapter")
+                await _run("hciconfig hci0 reset")
+                await asyncio.sleep(2)
+                await _run("hciconfig hci0 up")
+                await asyncio.sleep(1)
+            else:
+                log.error("BLE scan failed: %s", e)
+                return None, None
+    if devices is None:
+        return None, None
     device = None
     for addr, (dev, adv) in devices.items():
         name = adv.local_name or dev.name or ""
         if mac and addr.upper() == mac.upper():
             device = dev
             break
-        if name.upper().startswith(name_prefix.upper()):
+        if not mac and name.upper().startswith(name_prefix.upper()):
             device = dev
             break
 
@@ -340,15 +370,33 @@ async def poll_battery(
 
     log.debug("Found %s (%s)", device.name or "?", device.address)
 
-    # ── Connect ───────────────────────────────────────────────────
-    client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT)
+    # ── Connect (with retry) ─────────────────────────────────────
+    # Fresh BleakClient per attempt — a failed connect can leave the
+    # client/BlueZ in a dirty state, so reusing the same object risks
+    # compounding the problem.
+    client = None
     try:
-        await client.connect()
-    except Exception as e:
-        log.error("BLE connect failed: %s", e)
-        return None, None
+        for attempt in range(1, BLE_CONNECT_RETRIES + 1):
+            client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT)
+            try:
+                await client.connect()
+                break
+            except Exception as e:
+                # Best-effort cleanup of partial connection state
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
+                except Exception:
+                    pass
+                client = None
+                if attempt < BLE_CONNECT_RETRIES:
+                    log.warning("BLE connect attempt %d/%d failed: %s",
+                                attempt, BLE_CONNECT_RETRIES, e)
+                    await asyncio.sleep(2)
+                else:
+                    log.error("BLE connect failed after %d attempts: %s",
+                              BLE_CONNECT_RETRIES, e)
+                    return None, None
 
-    try:
         # Grab characteristic objects right away (bleak macOS cache quirk)
         svcs = client.services
         await asyncio.sleep(0.5)
@@ -438,11 +486,145 @@ async def poll_battery(
         return None, None
 
     finally:
-        if client.is_connected:
+        if client:
             try:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), timeout=5)
             except Exception:
                 pass
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Wanderer BT-1 Protocol
+# ══════════════════════════════════════════════════════════════════════
+
+BT1_WRITE_UUID = "0000ffd1-0000-1000-8000-00805f9b34fb"
+BT1_NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+CHARGE_STATES = {
+    0: "Deactivated", 1: "Activated", 2: "MPPT", 3: "Equalize",
+    4: "Boost", 5: "Float", 6: "Current limiting",
+}
+
+
+def wanderer_request(address: int, start: int, count: int) -> bytes:
+    """Build a function-03 register read; never emit controller writes."""
+    if not 1 <= address <= 255:
+        raise ValueError("Wanderer address must be between 1 and 255")
+    if not 0 <= start <= 0xFFFF or not 1 <= count <= 125:
+        raise ValueError("Invalid Modbus register range")
+    body = bytes([address, 3]) + start.to_bytes(2, "big") + count.to_bytes(2, "big")
+    return body + crc_modbus(body).to_bytes(2, "little")
+
+
+def decode_wanderer_response(frame: bytes, address: int, count: int) -> list[int]:
+    """Validate a complete Modbus response, including exceptions and wire CRC."""
+    if len(frame) < 5:
+        raise ValueError("Truncated Wanderer response")
+    if crc_modbus(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+        raise ValueError("Wanderer response CRC mismatch")
+    if frame[0] != address:
+        raise ValueError("Unexpected Wanderer response address")
+    if frame[1] == 0x83 and len(frame) == 5:
+        raise ValueError(f"Wanderer Modbus exception 0x{frame[2]:02X}")
+    if frame[1] != 3 or frame[2] != count * 2 or len(frame) != count * 2 + 5:
+        raise ValueError("Unexpected Wanderer response function or length")
+    return [int.from_bytes(frame[i:i + 2], "big")
+            for i in range(3, len(frame) - 2, 2)]
+
+
+def decode_wanderer_data(registers: list[int], state: int) -> dict:
+    if len(registers) != 10 or not 0 <= registers[0] <= 100:
+        raise ValueError("Invalid Wanderer telemetry registers")
+
+    def temperature(raw):
+        return -(raw & 0x7F) if raw & 0x80 else raw
+
+    voltage = registers[1] / 10
+    current = registers[2] / 100
+    charge_state = state & 0xFF
+    return {
+        "solar_voltage": registers[7] / 10,
+        "solar_current": registers[8] / 100,
+        "solar_power": registers[9],
+        "battery_voltage": voltage,
+        "charge_current": current,
+        "charge_power": round(voltage * current, 2),
+        "controller_temp": temperature(registers[3] >> 8),
+        "battery_temp": temperature(registers[3] & 0xFF),
+        "soc": registers[0],
+        "charge_state": CHARGE_STATES.get(charge_state, f"Unknown ({charge_state})"),
+    }
+
+
+async def poll_wanderer(mac: str, address: int = WANDERER_ADDRESS) -> dict:
+    """One bounded scan/connect/read/disconnect cycle, serialized with batteries."""
+    device = await BleakScanner.find_device_by_address(mac, timeout=BLE_SCAN_TIMEOUT)
+    if device is None:
+        raise RuntimeError("Wanderer BT-1 not found in BLE scan")
+    client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT)
+    try:
+        await client.connect()
+        write = client.services.get_characteristic(BT1_WRITE_UUID)
+        notify = client.services.get_characteristic(BT1_NOTIFY_UUID)
+        if write is None or notify is None:
+            raise RuntimeError("Wanderer BT-1 missing FFD1/FFF1 characteristics")
+        queue = asyncio.Queue()
+
+        def on_notify(_sender, data):
+            queue.put_nowait(bytes(data))
+
+        await client.start_notify(notify, on_notify)
+
+        async def read_registers(start, count):
+            while not queue.empty():
+                queue.get_nowait()
+            await client.write_gatt_char(
+                write, wanderer_request(address, start, count), response=False,
+            )
+            frame = bytearray()
+
+            async def receive():
+                while True:
+                    frame.extend(await queue.get())
+                    if len(frame) < 3:
+                        continue
+                    if frame[0] != address or frame[1] not in (3, 0x83):
+                        raise ValueError("Unexpected Wanderer response header")
+                    length = 5 if frame[1] == 0x83 else frame[2] + 5
+                    if len(frame) >= length:
+                        return decode_wanderer_response(bytes(frame), address, count)
+
+            return await asyncio.wait_for(receive(), timeout=BLE_CMD_TIMEOUT)
+
+        registers = await read_registers(0x0100, 10)
+        await asyncio.sleep(0.3)
+        state, = await read_registers(0x0120, 1)
+        return decode_wanderer_data(registers, state)
+    finally:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5)
+        except Exception as exc:
+            log.warning("Wanderer BT-1 disconnect failed: %s", exc)
+
+
+async def update_wanderer(client, mac, address):
+    """Publish a complete validated sample, or explicitly mark it unavailable."""
+    try:
+        data = await asyncio.wait_for(
+            poll_wanderer(mac, address), timeout=BLE_POLL_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("Wanderer poll failed (%s): %s", type(exc).__name__, exc)
+        client.publish(f"{WANDERER_PREFIX}/availability", "offline", qos=1, retain=True)
+        return False
+    for object_id, value in data.items():
+        _pub(client, WANDERER_PREFIX, object_id, value)
+    client.publish(f"{WANDERER_PREFIX}/availability", "online", qos=1, retain=True)
+    log.info("Wanderer: battery=%.1fV charge=%.2fA solar=%.1fV/%.2fA/%dW %s",
+             data["battery_voltage"], data["charge_current"], data["solar_voltage"],
+             data["solar_current"], data["solar_power"], data["charge_state"])
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -455,7 +637,8 @@ def _pub(client, prefix, obj_id, state):
 
 
 def _disco_sensor(client, prefix, device, obj_id, name, unit=None,
-                  dev_cls=None, state_cls="measurement", entity_cat=None):
+                  dev_cls=None, state_cls="measurement", entity_cat=None,
+                  expire_after=None):
     """Publish HA sensor auto-discovery config."""
     config = {
         "name": name,
@@ -472,6 +655,14 @@ def _disco_sensor(client, prefix, device, obj_id, name, unit=None,
         config["state_class"] = state_cls
     if entity_cat:
         config["entity_category"] = entity_cat
+    if expire_after is not None:
+        config["expire_after"] = expire_after
+        del config["availability_topic"]
+        config["availability_mode"] = "all"
+        config["availability"] = [
+            {"topic": f"{prefix}/availability"},
+            {"topic": f"{GOKWH_PREFIX}/availability"},
+        ]
     topic = f"{DISCOVERY_PREFIX}/sensor/{prefix}/{obj_id}/config"
     client.publish(topic, json.dumps(config), qos=1, retain=True)
 
@@ -498,10 +689,12 @@ def _disco_binary(client, prefix, device, obj_id, name,
 
 # ── GoKWh Battery ──────────────────────────────────────────────────
 
-def publish_gokwh_discovery(client, device_info=None):
-    """Register all GoKWh battery entities with HA."""
-    p = GOKWH_PREFIX
-    d = dict(GOKWH_DEVICE)
+def publish_gokwh_discovery(client, prefix, device, device_info=None, mac=None):
+    """Register GoKWh battery entities with HA."""
+    p = prefix
+    d = dict(device)
+    if mac:
+        d["connections"] = [["mac", mac.upper()]]
     if device_info:
         if device_info.get("sw_version"):
             d["sw_version"] = device_info["sw_version"]
@@ -533,12 +726,12 @@ def publish_gokwh_discovery(client, device_info=None):
     _disco_binary(client, p, d, "protection_active", "Protection Active",
                   "problem")
 
-    log.info("GoKWh discovery published (19 entities)")
+    log.info("%s discovery published (19 entities)", d["name"])
 
 
-def publish_gokwh_state(client, data: dict):
-    """Push all GoKWh battery sensor values to MQTT."""
-    p = GOKWH_PREFIX
+def publish_gokwh_state(client, prefix, data: dict):
+    """Push GoKWh battery sensor values to MQTT."""
+    p = prefix
 
     _pub(client, p, "pack_voltage", f"{data['voltage']:.2f}")
     _pub(client, p, "current", f"{data['current']:.1f}")
@@ -571,23 +764,28 @@ def publish_gokwh_state(client, data: dict):
     _pub(client, p, "status", status)
 
 
-# ── Renogy Wanderer (placeholder — RS232 not yet wired) ───────────
+# ── Renogy Wanderer ──────────────────────────────────────────────
 
-def publish_wanderer_discovery(client):
-    """Register Renogy Wanderer entities with HA (placeholder)."""
+def publish_wanderer_discovery(client, expire_after=180):
+    """Register controller sensors, gated by poll health and the Pi process LWT."""
     p, d = WANDERER_PREFIX, WANDERER_DEVICE
-    _disco_sensor(client, p, d, "solar_voltage", "Solar Voltage", "V", "voltage")
-    _disco_sensor(client, p, d, "solar_current", "Solar Current", "A", "current")
-    _disco_sensor(client, p, d, "solar_power", "Solar Power", "W", "power")
-    _disco_sensor(client, p, d, "battery_voltage", "Battery Voltage", "V", "voltage")
-    _disco_sensor(client, p, d, "charge_current", "Charge Current", "A", "current")
-    _disco_sensor(client, p, d, "charge_power", "Charge Power", "W", "power")
-    _disco_sensor(client, p, d, "controller_temp", "Controller Temp", "°C",
-                  "temperature")
-    _disco_sensor(client, p, d, "battery_temp", "Battery Temp", "°C", "temperature")
-    _disco_sensor(client, p, d, "soc", "State of Charge", "%", "battery")
-    _disco_sensor(client, p, d, "charge_state", "Charge State", state_cls=None)
-    log.info("Wanderer discovery published (10 entities, data pending RS232)")
+    sensors = [
+        ("solar_voltage", "Solar Voltage", "V", "voltage"),
+        ("solar_current", "Solar Current", "A", "current"),
+        ("solar_power", "Solar Power", "W", "power"),
+        ("battery_voltage", "Battery Voltage", "V", "voltage"),
+        ("charge_current", "Charge Current", "A", "current"),
+        ("charge_power", "Charge Power", "W", "power"),
+        ("controller_temp", "Controller Temp", "°C", "temperature"),
+        ("battery_temp", "Battery Temp", "°C", "temperature"),
+        ("soc", "Controller Estimated SOC", "%", "battery"),
+        ("charge_state", "Charge State", None, None),
+    ]
+    for obj_id, name, unit, dev_cls in sensors:
+        _disco_sensor(client, p, d, obj_id, name, unit, dev_cls,
+                      state_cls=None if obj_id == "charge_state" else "measurement",
+                      expire_after=expire_after)
+    log.info("Wanderer discovery published (10 entities)")
 
 
 # ── Solar Pi Management ────────────────────────────────────────────
@@ -765,23 +963,56 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Solar Monitor v2 — GoKWh + Renogy + Pi → Home Assistant",
     )
-    parser.add_argument("--mac", help="GoKWh battery MAC (optional, for Linux)")
+    parser.add_argument("--mac", "--mac1", dest="mac1",
+                        help="GoKWh battery 1 MAC address")
+    parser.add_argument("--mac2",
+                        help="GoKWh battery 2 MAC address")
     parser.add_argument("--mqtt-host", default=MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=MQTT_PORT)
     parser.add_argument("--poll-interval", type=int, default=BLE_POLL_INTERVAL,
                         help="BLE poll interval in seconds (default: 60)")
     parser.add_argument("--no-wanderer", action="store_true",
-                        help="Skip Renogy Wanderer discovery")
+                        help="Disable Renogy Wanderer discovery and polling")
+    parser.add_argument("--wanderer-mac", default=os.environ.get("WANDERER_MAC"),
+                        help="BT-1 MAC address (or WANDERER_MAC environment variable)")
+    parser.add_argument("--wanderer-address", type=lambda value: int(value, 0),
+                        default=os.environ.get("WANDERER_ADDRESS", "0xFF"),
+                        help="Modbus device address (default: 0xFF)")
     parser.add_argument("--no-pi", action="store_true",
                         help="Skip Pi management (for Mac testing)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be positive")
+    if not 1 <= args.wanderer_address <= 255:
+        parser.error("--wanderer-address must be between 1 and 255")
+    if args.wanderer_mac and not re.fullmatch(
+            r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", args.wanderer_mac):
+        parser.error("--wanderer-mac must be a colon-separated BLE MAC address")
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # ── Resolve battery MACs ──────────────────────────────────────
+    mac1 = args.mac1 or os.environ.get("BLE_MAC_1") or os.environ.get("BLE_MAC")
+    mac2 = args.mac2 or os.environ.get("BLE_MAC_2")
+
+    # Build list of battery configs: (prefix, device_dict, mac)
+    batteries = [(GOKWH_PREFIX, GOKWH_DEVICE, mac1)]
+    if mac2:
+        batteries.append((GOKWH_2_PREFIX, GOKWH_2_DEVICE, mac2))
+    wanderer_enabled = bool(args.wanderer_mac) and not args.no_wanderer
+    if wanderer_enabled and any(
+            mac and mac.upper() == args.wanderer_mac.upper() for _, _, mac in batteries):
+        parser.error("Wanderer and battery MAC addresses must be different")
+    if not args.no_wanderer and not args.wanderer_mac:
+        log.warning("WANDERER_MAC not configured; controller will remain unavailable")
+    wanderer_expiry = max(180, args.poll_interval * 3)
+    pi_mgr = None
+
     # ── Shared state ──────────────────────────────────────────────
-    gokwh_device_info = None   # populated on first successful poll
+    # Per-battery device info, populated on first successful poll
+    gokwh_device_infos = {prefix: None for prefix, _, _ in batteries}
 
     # ── MQTT client ───────────────────────────────────────────────
     mqtt_client = mqtt.Client(
@@ -800,14 +1031,17 @@ async def main():
             return
         log.info("MQTT connected to %s:%d", args.mqtt_host, args.mqtt_port)
 
-        publish_gokwh_discovery(client, gokwh_device_info)
-        client.publish(f"{GOKWH_PREFIX}/availability", "online",
-                       qos=1, retain=True)
+        for prefix, device, _mac in batteries:
+            publish_gokwh_discovery(client, prefix, device,
+                                    gokwh_device_infos[prefix], mac=_mac)
+            client.publish(f"{prefix}/availability", "online",
+                           qos=1, retain=True)
 
         if not args.no_wanderer:
-            publish_wanderer_discovery(client)
-            client.publish(f"{WANDERER_PREFIX}/availability", "offline",
-                           qos=1, retain=True)
+            publish_wanderer_discovery(client, wanderer_expiry)
+        client.publish(f"{WANDERER_PREFIX}/availability", "offline",
+                       qos=1, retain=True)
+        client.subscribe(f"{DISCOVERY_PREFIX}/status")
 
         if not args.no_pi:
             publish_pi_discovery(client)
@@ -816,6 +1050,10 @@ async def main():
             client.subscribe(f"{PI_PREFIX}/+/set")
 
     def on_message(client, userdata, message):
+        if message.topic == f"{DISCOVERY_PREFIX}/status":
+            if message.payload == b"online" and not args.no_wanderer:
+                publish_wanderer_discovery(client, wanderer_expiry)
+            return
         parts = message.topic.split("/")
         if len(parts) == 3 and parts[0] == PI_PREFIX and parts[2] == "set":
             payload = message.payload.decode("utf-8", errors="replace").strip()
@@ -837,61 +1075,88 @@ async def main():
         pi_mgr = PiManager(mqtt_client)
         _pub(mqtt_client, PI_PREFIX, "fan_mode", "Auto")
 
-    log.info("Starting poll loops: battery=%ds, pi=%ds",
-             args.poll_interval, PI_POLL_INTERVAL if pi_mgr else 0)
+    log.info("Starting poll loops: BLE=%ds (%d batteries, Wanderer=%s), pi=%ds",
+             args.poll_interval, len(batteries),
+             args.wanderer_mac if wanderer_enabled else "disabled",
+             PI_POLL_INTERVAL if pi_mgr else 0)
 
     # ── Shared state across tasks ────────────────────────────────
-    # Written atomically by battery_loop, read by pi_loop
-    shared = {"battery_temps": None, "battery_temps_at": 0.0}
+    # Per-battery temps, written by battery_loop, read by pi_loop
+    shared = {
+        "battery_temps": {},      # prefix → temp list
+        "battery_temps_at": {},   # prefix → timestamp
+    }
 
     # ── Battery polling task ──────────────────────────────────────
     async def battery_loop():
-        nonlocal gokwh_device_info
-        consecutive_fails = 0
+        # Per-battery tracking
+        consecutive_fails = {prefix: 0 for prefix, _, _ in batteries}
+        if wanderer_enabled:
+            consecutive_fails[WANDERER_PREFIX] = 0
         ev_loop = asyncio.get_event_loop()
 
         while True:
             t0 = ev_loop.time()
             try:
-                try:
-                    data, info = await asyncio.wait_for(
-                        poll_battery(mac=args.mac),
-                        timeout=BLE_POLL_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("BLE poll timed out after %ds", BLE_POLL_TIMEOUT)
-                    data, info = None, None
-                except Exception as e:
-                    log.warning("BLE poll error: %s", e)
-                    data, info = None, None
+                for prefix, device, mac in batteries:
+                    try:
+                        data, info = await asyncio.wait_for(
+                            poll_battery(mac=mac),
+                            timeout=BLE_POLL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("%s: BLE poll timed out after %ds",
+                                    device["name"], BLE_POLL_TIMEOUT)
+                        data, info = None, None
+                    except Exception as e:
+                        log.warning("%s: BLE poll error: %s", device["name"], e)
+                        data, info = None, None
 
-                if data:
-                    consecutive_fails = 0
-                    _pub(mqtt_client, GOKWH_PREFIX, "ble_connected", "ON")
-                    publish_gokwh_state(mqtt_client, data)
-                    shared["battery_temps"] = data.get("temperatures")
-                    shared["battery_temps_at"] = time.time()
+                    if data:
+                        consecutive_fails[prefix] = 0
+                        _pub(mqtt_client, prefix, "ble_connected", "ON")
+                        publish_gokwh_state(mqtt_client, prefix, data)
+                        shared["battery_temps"][prefix] = data.get("temperatures")
+                        shared["battery_temps_at"][prefix] = time.time()
 
-                    if info and info != gokwh_device_info:
-                        gokwh_device_info = info
-                        publish_gokwh_discovery(mqtt_client, info)
-                        log.info("Device info: %s", info)
+                        if info and info != gokwh_device_infos[prefix]:
+                            gokwh_device_infos[prefix] = info
+                            publish_gokwh_discovery(mqtt_client, prefix,
+                                                    device, info, mac=mac)
+                            log.info("%s device info: %s", device["name"], info)
 
-                    log.info(
-                        "Battery: %.2fV  %.1fA  %d%%  %.1f°C  Δ%dmV",
-                        data["voltage"], data["current"], data["soc"],
-                        data["temperatures"][0] if data["temperatures"] else 0,
-                        data["cell_delta"],
-                    )
-                else:
-                    consecutive_fails += 1
-                    _pub(mqtt_client, GOKWH_PREFIX, "ble_connected", "OFF")
-                    if consecutive_fails >= BLE_RESET_THRESHOLD:
-                        log.error("%d consecutive BLE failures — resetting BlueZ",
-                                  consecutive_fails)
-                        await reset_bluez()
-                        consecutive_fails = 0
-                        shared["battery_temps"] = None
+                        log.info(
+                            "%s: %.2fV  %.1fA  %d%%  %.1f°C  Δ%dmV",
+                            device["name"],
+                            data["voltage"], data["current"], data["soc"],
+                            data["temperatures"][0] if data.get("temperatures") else 0,
+                            data["cell_delta"],
+                        )
+                    else:
+                        consecutive_fails[prefix] += 1
+                        _pub(mqtt_client, prefix, "ble_connected", "OFF")
+
+                    # Small gap between polling each battery
+                    if len(batteries) > 1:
+                        await asyncio.sleep(2)
+
+                if wanderer_enabled:
+                    if await update_wanderer(
+                            mqtt_client, args.wanderer_mac, args.wanderer_address):
+                        consecutive_fails[WANDERER_PREFIX] = 0
+                    else:
+                        consecutive_fails[WANDERER_PREFIX] += 1
+
+                # Reset only when ALL configured BLE devices are failing.
+                if all(f >= BLE_RESET_THRESHOLD
+                       for f in consecutive_fails.values()):
+                    total = sum(consecutive_fails.values())
+                    log.error("%d total consecutive BLE failures — resetting BlueZ",
+                              total)
+                    await reset_bluez()
+                    for p in consecutive_fails:
+                        consecutive_fails[p] = 0
+                    shared["battery_temps"].clear()
 
             except asyncio.CancelledError:
                 raise
@@ -908,22 +1173,24 @@ async def main():
         while True:
             try:
                 now = time.time()
-                temps_age = now - shared["battery_temps_at"]
+                # Combine fresh temps from all batteries
+                all_temps = []
+                oldest_age = 0.0
+                for prefix in shared["battery_temps"]:
+                    age = now - shared["battery_temps_at"].get(prefix, 0)
+                    temps = shared["battery_temps"].get(prefix)
+                    if temps and age <= BATTERY_TEMP_TTL:
+                        all_temps.extend(temps)
+                    oldest_age = max(oldest_age, age)
                 pi_mgr.update(
-                    battery_temps=shared["battery_temps"],
-                    battery_temps_age=temps_age,
+                    battery_temps=all_temps or None,
+                    battery_temps_age=oldest_age,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.error("pi_loop iteration error: %s", e, exc_info=True)
             await asyncio.sleep(PI_POLL_INTERVAL)
-
-    # ── Wanderer polling task (placeholder) ───────────────────────
-    async def wanderer_loop():
-        # Will be implemented when RS232 hardware arrives
-        while True:
-            await asyncio.sleep(60)
 
     # ── Task supervisor ───────────────────────────────────────────
     managed_tasks: dict[str, asyncio.Task] = {}
@@ -952,8 +1219,6 @@ async def main():
     _start_task("battery", battery_loop)
     if pi_mgr:
         _start_task("pi", pi_loop)
-    if not args.no_wanderer:
-        _start_task("wanderer", wanderer_loop)
 
     # Wait for shutdown signal, then cancel all tasks
     await shutdown.wait()
@@ -963,11 +1228,17 @@ async def main():
 
     # ── Cleanup ───────────────────────────────────────────────────
     log.info("Shutting down…")
-    mqtt_client.publish(f"{GOKWH_PREFIX}/availability", "offline",
-                        qos=1, retain=True)
+    for prefix, _, _ in batteries:
+        mqtt_client.publish(f"{prefix}/availability", "offline",
+                            qos=1, retain=True)
     if not args.no_pi:
         mqtt_client.publish(f"{PI_PREFIX}/availability", "offline",
                             qos=1, retain=True)
+    controller_offline = mqtt_client.publish(
+        f"{WANDERER_PREFIX}/availability", "offline", qos=1, retain=True,
+    )
+    if mqtt_client.is_connected():
+        controller_offline.wait_for_publish(timeout=3)
     if pi_mgr:
         pi_mgr.shutdown()
     mqtt_client.loop_stop()
