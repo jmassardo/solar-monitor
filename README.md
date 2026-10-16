@@ -2,7 +2,7 @@
 
 Off-grid solar monitoring for Home Assistant via MQTT. Runs on a Raspberry Pi 3
 B+ and publishes three independent devices — a GoKWh LiFePO4 battery (BLE), a
-Renogy Wanderer charge controller (RS232, pending), and the Pi itself
+Renogy Wanderer charge controller (BT-1 BLE), and the Pi itself
 (environmental sensors, enclosure management).
 
 ## Hardware
@@ -10,7 +10,7 @@ Renogy Wanderer charge controller (RS232, pending), and the Pi itself
 | Component | Interface | Status |
 |-----------|-----------|--------|
 | **GoKWh 100Ah LiFePO4** | Bluetooth LE (TDT BMS protocol) | ✅ Working |
-| **Renogy Wanderer 10A PWM** | RS232 Modbus RTU | ⏳ Waiting on RS232-TTL adapter |
+| **Renogy Wanderer Li 30A PWM** | Read-only Modbus via Renogy BT-1 BLE | Working |
 | **Raspberry Pi 3 B+** | Local GPIO / I²C | ✅ Working |
 | 300W Inverter | — (no data interface) | — |
 | 2× 100W Solar Panels | Via Wanderer | ⏳ |
@@ -26,19 +26,20 @@ Renogy Wanderer charge controller (RS232, pending), and the Pi itself
 ```mermaid
 graph LR
     Battery["GoKWh Battery<br/>(TDT BMS)"] <-->|BLE| Pi["Raspberry Pi<br/>solar_monitor_v2.py<br/>BME280, relay, door switch"]
-    Wanderer["Renogy Wanderer<br/>(pending)"] <-->|RS232| Pi
+    Wanderer["Renogy Wanderer Li 30A"] <-->|BT-1 BLE| Pi
     Pi -->|MQTT| HA["Home Assistant"]
     HA -->|commands| Pi
 ```
 
 Each component appears as a **separate device** in Home Assistant with its own
-availability tracking. The script uses independent async polling loops:
+availability tracking. Batteries and the BT-1 share one serialized BLE worker;
+the Pi hardware loop remains independent:
 
 | Device | Poll Interval | Transport |
 |--------|---------------|-----------|
 | GoKWh Battery | 60s | BLE scan → connect → auth → poll → disconnect |
 | Solar Pi | 2s | Local GPIO / I²C |
-| Renogy Wanderer | TBD | RS232 Modbus RTU (not yet implemented) |
+| Renogy Wanderer | Once per BLE round (normally 60s) | BT-1 connect → read → disconnect |
 
 ## Home Assistant Entities
 
@@ -74,9 +75,32 @@ availability tracking. The script uses independent async polling loops:
 
 ### Renogy Wanderer (`solar_wanderer/`)
 
-Entities are registered in HA but show as unavailable until RS232 hardware is
-connected. Will include: panel voltage/current/power, battery voltage/current,
-charge state, load state, controller temperature.
+Ten entities report panel voltage/current/power, battery voltage, charge
+current/power, controller/battery temperatures, controller-estimated SOC, and
+charge state. Existing `solar_wanderer` topics, unique IDs and device ID
+`solar_renogy_wanderer` are preserved. Charge power is battery voltage times
+charging current, not the battery's net power.
+
+Set `WANDERER_MAC` in `/opt/solar-monitor/.env` to the BT-1's BLE address and
+restart `solar-monitor`. `WANDERER_ADDRESS=0xFF` is the default Renogy standalone
+address; only change it to a known controller address (1-255). Close the Renogy
+phone app so it does not hold the BLE connection. No additional dependencies or
+service command changes are required.
+
+The Pi subscribes to `FFF1` notifications and sends only CRC-protected Modbus
+function-03 reads through `FFD1`: registers `0x0100`-`0x0109` and `0x0120`.
+No charging parameters or load switches are written. Failed scans, timeouts,
+bad CRCs and Modbus exceptions mark the controller unavailable without
+publishing replacement zeroes. All ten readings must succeed before publishing
+online. Sensors expire after the greater of 180 seconds or three configured
+poll intervals; controller availability also follows the Pi process's existing
+`solar_gokwh/availability` last will. MQTT reconnect requires a fresh read before
+online; Home Assistant's birth message republishes discovery.
+
+The controller's SOC is an estimate and can differ substantially from the
+LiFePO4 BMS: use the battery's own SOC for capacity decisions. The reported
+battery temperature is the controller's temperature register, not a BMS probe.
+Zero solar power and charging current are normal at night.
 
 ## Installation
 
@@ -157,7 +181,9 @@ Options:
   --mqtt-host HOST    MQTT broker address (default: localhost)
   --mqtt-port PORT    MQTT broker port (default: 1883)
   --poll-interval SEC BLE poll interval in seconds (default: 60)
-  --no-wanderer       Skip Renogy Wanderer discovery
+  --wanderer-mac MAC  Renogy BT-1 MAC (or WANDERER_MAC in .env)
+  --wanderer-address N Modbus address (or WANDERER_ADDRESS; default 0xFF)
+  --no-wanderer       Disable Renogy Wanderer discovery and polling
   --no-pi             Skip Pi management (for local Mac testing)
   --debug             Enable debug logging
 ```
@@ -197,10 +223,20 @@ handles this with:
 
 ### Task Supervision
 
-Each polling loop (battery, Pi, wanderer) runs as an independent `asyncio`
+Each polling loop (serialized battery/controller BLE, and Pi) runs as an independent `asyncio`
 task. A supervisor callback detects dead tasks and restarts them after 5
 seconds. Outer try/except blocks around each loop body prevent any single error
 from killing a task.
+
+### Python regression tests
+
+With the application's `bleak` and `paho-mqtt` dependencies installed, run:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+These tests use fake BLE/MQTT devices and do not require GPIO or live hardware.
 
 ## GoKWh BLE Protocol (TDT BMS)
 
